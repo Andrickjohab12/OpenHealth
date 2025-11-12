@@ -1,17 +1,85 @@
+from fastapi import FastAPI, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 from datetime import datetime
-from random import randint
-from fastapi import FastAPI, HTTPException, Response
-from typing import Any
+import random
+import psycopg2
 
-from sqlmodel import create_engine
+# Configuración de la base de datos PostgreSQL
+DATABASE_URL = "postgresql://usuario:contraseña@localhost/openhealth"
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
-sqlite_file_name = "database.db"
-sqlite_url = f"sqlite:///{sqlite_file_name}"
+# Modelos
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    nombre = Column(String, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    # Puedes agregar más campos aquí
+    locations = relationship("Location", back_populates="user")
 
-connect_args = {"check_same_thread": False}
-engine = create_engine(sqlite_url, connect_args=connect_args)
+class Location(Base):
+    __tablename__ = "locations"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    user = relationship("User", back_populates="locations")
 
+# Crear tablas (solo la primera vez)
+Base.metadata.create_all(bind=engine)
+
+# FastAPI app
 app = FastAPI(root_path="/api/v1")
+
+# Esquemas Pydantic
+class UserCreate(BaseModel):
+    nombre: str
+    email: str
+
+class LocationCreate(BaseModel):
+    user_id: int
+    latitude: float
+    longitude: float
+    timestamp: datetime = None
+
+# Dependencia para obtener sesión de BD
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Endpoint para crear usuario
+@app.post("/api/users")
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = User(nombre=user.nombre, email=user.email)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+# Endpoint para guardar ubicación
+@app.post("/api/location")
+def save_location(location: LocationCreate, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.id == location.user_id).first()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    db_location = Location(
+        user_id=location.user_id,
+        latitude=location.latitude,
+        longitude=location.longitude,
+        timestamp=location.timestamp or datetime.utcnow()
+    )
+    db.add(db_location)
+    db.commit()
+    db.refresh(db_location)
+    return db_location
 
 @app.get("/")
 async def root():
@@ -55,7 +123,7 @@ async def read_campaign(id: int):
 async def create_campaign(body: dict[str, Any]):
 
     new : Any = {
-        "campaign_id": randint(100, 1000),
+        "campaign_id": random.randint(100, 1000),
         "name": body.get("name"),
         "due_date": body.get("due_date"),
         "created_at": datetime.now()
