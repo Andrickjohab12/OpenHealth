@@ -19,9 +19,59 @@ export function MapView() {
     centerLng: -117.1611,
     zoom: 13,
   })
+  // Keep the initial center so we can reset to it later
+  const initialCenter = useRef({ centerLat: 32.7157, centerLng: -117.1611, zoom: 13 })
+  const [userLocation, setUserLocation] = useState<{ lat: number; lng: number } | null>(null)
+  const [isFollowing, setIsFollowing] = useState(false)
+  const watchIdRef = useRef<number | null>(null)
   const [isDragging, setIsDragging] = useState(false)
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 })
   const tilesCache = useRef<Map<string, HTMLImageElement>>(new Map())
+  const animRef = useRef<{ canceled?: boolean } | null>(null)
+  const mapStateRef = useRef(mapState)
+  const drawGenRef = useRef(0)
+  const dragLastRef = useRef<{ x: number; y: number } | null>(null)
+  const rafPanRef = useRef<number | null>(null)
+  const [sizeTick, setSizeTick] = useState(0)
+  // Tile loading limits and LRU cache
+  const TILE_CONCURRENCY = 6
+  const MAX_TILE_CACHE = 300
+  const tileActiveCount = useRef(0)
+  const tileQueue = useRef<Array<() => void>>([])
+  const tileLRU = useRef<string[]>([])
+
+  // Smoothly animate map center/zoom to a target using requestAnimationFrame
+  const animateTo = (
+    target: { centerLat: number; centerLng: number; zoom?: number },
+    duration = 600,
+  ) => {
+    // cancel previous
+    if (animRef.current) animRef.current.canceled = true
+    const token = { canceled: false }
+    animRef.current = token
+
+    const start = performance.now()
+    const from = { ...mapState }
+    const to = { centerLat: target.centerLat, centerLng: target.centerLng, zoom: target.zoom ?? from.zoom }
+
+    const ease = (t: number) => (t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t) // easeInOutQuad-like
+
+    const step = (now: number) => {
+      if (token.canceled) return
+      const t = Math.min(1, (now - start) / duration)
+      const e = ease(t)
+      const lat = from.centerLat + (to.centerLat - from.centerLat) * e
+      const lng = from.centerLng + (to.centerLng - from.centerLng) * e
+      const zoom = from.zoom + (to.zoom - from.zoom) * e
+      setMapState({ centerLat: lat, centerLng: lng, zoom })
+      if (t < 1) requestAnimationFrame(step)
+    }
+
+    requestAnimationFrame(step)
+    return () => {
+      token.canceled = true
+    }
+  }
 
   // Convert lat/lng to tile coordinates
   const latLngToTile = (lat: number, lng: number, zoom: number) => {
@@ -61,22 +111,67 @@ export function MapView() {
   }
 
   // Load and cache tile images
+  const processTileQueue = () => {
+    if (tileActiveCount.current >= TILE_CONCURRENCY) return
+    const next = tileQueue.current.shift()
+    if (!next) return
+    tileActiveCount.current += 1
+    try {
+      next()
+    } finally {
+      tileActiveCount.current = Math.max(0, tileActiveCount.current - 1)
+      // schedule next microtask to process queue
+      setTimeout(processTileQueue, 0)
+    }
+  }
+
+  const enqueueTileLoad = (fn: () => void) => {
+    tileQueue.current.push(fn)
+    // try to process immediately
+    processTileQueue()
+  }
+
+  const markTileUsed = (key: string) => {
+    const idx = tileLRU.current.indexOf(key)
+    if (idx !== -1) tileLRU.current.splice(idx, 1)
+    tileLRU.current.push(key)
+    // evict if too many
+    while (tileLRU.current.length > MAX_TILE_CACHE) {
+      const old = tileLRU.current.shift()
+      if (old) tilesCache.current.delete(old)
+    }
+  }
+
   const loadTile = (x: number, y: number, zoom: number): Promise<HTMLImageElement> => {
-    const key = `${zoom}-${x}-${y}`
+    // expect integer zoom (we pass tileZoom which is Math.floor(zoom))
+    const z = Math.floor(zoom)
+    const key = `${z}-${x}-${y}`
     if (tilesCache.current.has(key)) {
+      // refresh LRU
+      markTileUsed(key)
       return Promise.resolve(tilesCache.current.get(key)!)
     }
 
     return new Promise((resolve, reject) => {
-      const img = new Image()
-      img.crossOrigin = "anonymous"
-      img.onload = () => {
-        tilesCache.current.set(key, img)
-        resolve(img)
+      const doLoad = () => {
+        const img = new Image()
+        // DO NOT set crossOrigin here: many public tile servers (including tile.openstreetmap.org)
+        // don't return Access-Control-Allow-Origin and will cause the request to fail when
+        // crossOrigin is set. Not setting crossOrigin allows the image to load; note this
+        // will taint the canvas if you later try to read its pixels (toDataURL).
+        img.onload = () => {
+          tilesCache.current.set(key, img)
+          markTileUsed(key)
+          resolve(img)
+        }
+        img.onerror = () => {
+          reject(new Error("Tile load error"))
+        }
+        const server = ["a", "b", "c"][Math.floor(Math.random() * 3)]
+        img.src = `https://${server}.tile.openstreetmap.org/${z}/${x}/${y}.png`
       }
-      img.onerror = reject
-      const server = ["a", "b", "c"][Math.floor(Math.random() * 3)]
-      img.src = `https://${server}.tile.openstreetmap.org/${zoom}/${x}/${y}.png`
+
+      enqueueTileLoad(doLoad)
     })
   }
 
@@ -85,22 +180,36 @@ export function MapView() {
     const canvas = canvasRef.current
     if (!canvas) return
 
-    const ctx = canvas.getContext("2d")
-    if (!ctx) return
+  const ctx = canvas.getContext("2d")
+  if (!ctx) return
 
-    const width = canvas.width
-    const height = canvas.height
+  // Handle devicePixelRatio for crisp rendering
+  const dpr = window.devicePixelRatio || 1
+  const cssWidth = canvas.parentElement ? canvas.parentElement.clientWidth : canvas.clientWidth
+  const cssHeight = canvas.parentElement ? canvas.parentElement.clientHeight : canvas.clientHeight
+  canvas.width = Math.max(1, Math.floor(cssWidth * dpr))
+  canvas.height = Math.max(1, Math.floor(cssHeight * dpr))
+  // scale the context so drawing coordinates use CSS pixels
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+  const width = cssWidth
+  const height = cssHeight
 
     // Clear canvas
     ctx.fillStyle = "#e0f2fe"
     ctx.fillRect(0, 0, width, height)
 
-    const { centerLat, centerLng, zoom } = mapState
-    const centerTile = latLngToTile(centerLat, centerLng, zoom)
+  const { centerLat, centerLng, zoom } = mapState
+  // use floor zoom for tile requests and scale tiles for fractional zoom
+  const tileZoom = Math.floor(zoom)
+  // bump generation so stale tile loads won't draw
+  const generation = ++drawGenRef.current
+  const centerTile = latLngToTile(centerLat, centerLng, tileZoom)
+  const scaleFactor = Math.pow(2, zoom - tileZoom)
 
     // Calculate how many tiles we need to cover the canvas
-    const tilesX = Math.ceil(width / 256) + 2
-    const tilesY = Math.ceil(height / 256) + 2
+  const tilesX = Math.ceil(width / 256) + 2
+  const tilesY = Math.ceil(height / 256) + 2
 
     // Draw tiles
     const tilePromises: Promise<void>[] = []
@@ -111,11 +220,14 @@ export function MapView() {
 
         if (tileX < 0 || tileY < 0 || tileX >= Math.pow(2, zoom) || tileY >= Math.pow(2, zoom)) continue
 
-        const promise = loadTile(tileX, tileY, zoom)
+        const promise = loadTile(tileX, tileY, tileZoom)
           .then((img) => {
+            // ignore if a newer draw started
+            if (generation !== drawGenRef.current) return
             const centerPixel = latLngToPixel(centerLat, centerLng, zoom, centerLat, centerLng, width, height)
-            const tileWorldX = tileX * 256
-            const tileWorldY = tileY * 256
+            // tile image is at zoom = tileZoom, scale it to match fractional zoom
+            const tileWorldX = tileX * 256 * scaleFactor
+            const tileWorldY = tileY * 256 * scaleFactor
             const centerWorldX = ((centerLng + 180) / 360) * 256 * Math.pow(2, zoom)
             const centerWorldY =
               ((1 -
@@ -127,7 +239,9 @@ export function MapView() {
             const x = width / 2 + (tileWorldX - centerWorldX)
             const y = height / 2 + (tileWorldY - centerWorldY)
 
-            ctx.drawImage(img, x, y, 256, 256)
+            // draw scaled tile
+            const drawSize = 256 * scaleFactor
+            ctx.drawImage(img, x, y, drawSize, drawSize)
           })
           .catch(() => {
             // Silently fail for missing tiles
@@ -176,8 +290,128 @@ export function MapView() {
         ctx.closePath()
         ctx.fill()
       })
+
+      // Draw user location marker if available
+      if (userLocation) {
+        const posU = latLngToPixel(userLocation.lat, userLocation.lng, zoom, centerLat, centerLng, width, height)
+
+        // shadow
+        ctx.fillStyle = "rgba(0,0,0,0.2)"
+        ctx.beginPath()
+        ctx.ellipse(posU.x, posU.y + 2, 8, 4, 0, 0, Math.PI * 2)
+        ctx.fill()
+
+        // user circle
+        ctx.fillStyle = "#f59e0b"
+        ctx.strokeStyle = "white"
+        ctx.lineWidth = 2
+        ctx.beginPath()
+        ctx.arc(posU.x, posU.y - 6, 8, 0, Math.PI * 2)
+        ctx.fill()
+        ctx.stroke()
+
+        // label
+        ctx.fillStyle = "#111827"
+        ctx.font = "12px sans-serif"
+        ctx.textAlign = "center"
+        ctx.fillText("Tú", posU.x, posU.y - 18)
+      }
     })
+  }, [mapState, userLocation, sizeTick])
+
+  // Request user location on mount and optionally center map
+  useEffect(() => {
+    if (!("geolocation" in navigator)) return
+
+    const onSuccess = (pos: GeolocationPosition) => {
+      const lat = pos.coords.latitude
+      const lng = pos.coords.longitude
+      setUserLocation({ lat, lng })
+      console.log("Geolocation success:", { lat, lng })
+      // Optionally center the map when the user first grants permission
+      animateTo({ centerLat: lat, centerLng: lng }, 700)
+    }
+
+    const onError = (err: GeolocationPositionError) => {
+      // Keep default center if user denies or error occurs
+      console.warn("Geolocation error:", err.message)
+    }
+
+    // Try to get current position once
+    navigator.geolocation.getCurrentPosition(onSuccess, onError, {
+      enableHighAccuracy: true,
+      timeout: 10000,
+    })
+  }, [])
+
+  // keep mapStateRef up to date
+  useEffect(() => {
+    mapStateRef.current = mapState
   }, [mapState])
+
+  // Center map on user's location (single action)
+  const centerOnUser = () => {
+    if (!userLocation) {
+      if ("geolocation" in navigator) {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            const lat = pos.coords.latitude
+            const lng = pos.coords.longitude
+            setUserLocation({ lat, lng })
+            animateTo({ centerLat: lat, centerLng: lng, zoom: Math.max(mapState.zoom, 15) }, 700)
+          },
+          (err) => console.warn("Geolocation error:", err.message),
+          { enableHighAccuracy: true, timeout: 10000 },
+        )
+      }
+      return
+    }
+
+    animateTo({ centerLat: userLocation.lat, centerLng: userLocation.lng, zoom: Math.max(mapState.zoom, 15) }, 700)
+  }
+
+  // When isFollowing is enabled, start watchPosition to update userLocation continuously
+  useEffect(() => {
+    if (!("geolocation" in navigator)) return
+
+    if (isFollowing) {
+      // start watch
+      const id = navigator.geolocation.watchPosition(
+        (pos) => {
+          const lat = pos.coords.latitude
+          const lng = pos.coords.longitude
+          setUserLocation({ lat, lng })
+          // keep centering while following — smooth, short animation
+          animateTo({ centerLat: lat, centerLng: lng }, 300)
+        },
+        (err) => console.warn("Geolocation watch error:", err.message),
+        { enableHighAccuracy: true, maximumAge: 2000, timeout: 10000 },
+      )
+
+      watchIdRef.current = id
+    } else {
+      // stop watch if it exists
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current)
+        watchIdRef.current = null
+      }
+    }
+
+    // cleanup on unmount
+    return () => {
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current)
+        watchIdRef.current = null
+      }
+    }
+  }, [isFollowing])
+
+  // Reset map to the initial center
+  const resetToInitial = () => {
+    setMapState(initialCenter.current)
+    // also stop following if active
+    if (isFollowing) setIsFollowing(false)
+  }
 
   // Handle canvas click to select shelter
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -192,48 +426,132 @@ export function MapView() {
 
     // Check if click is near any marker
     for (const shelter of mockShelters) {
-      const pos = latLngToPixel(shelter.lat, shelter.lng, zoom, centerLat, centerLng, canvas.width, canvas.height)
+      const pos = latLngToPixel(shelter.lat, shelter.lng, zoom, centerLat, centerLng, rect.width, rect.height)
       const distance = Math.sqrt(Math.pow(clickX - pos.x, 2) + Math.pow(clickY - pos.y, 2))
 
       if (distance < 20) {
         setSelectedShelter(shelter)
-        setMapState({
-          centerLat: shelter.lat,
-          centerLng: shelter.lng,
-          zoom: Math.max(zoom, 15),
-        })
+        animateTo({ centerLat: shelter.lat, centerLng: shelter.lng, zoom: Math.max(zoom, 15) }, 600)
         return
       }
     }
   }
 
   // Handle mouse drag
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  // Pointer-based drag (unified mouse + touch)
+  const lastMoves = useRef<Array<{ x: number; y: number; t: number }>>([])
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const rect = canvas.getBoundingClientRect()
+    // capture pointer for consistent events
+    try {
+      ;(e.target as Element).setPointerCapture(e.pointerId)
+    } catch {}
     setIsDragging(true)
-    setDragStart({ x: e.clientX, y: e.clientY })
+    if (isFollowing) setIsFollowing(false)
+    // store local (rect) coords as drag start
+    const lx = e.clientX - rect.left
+    const ly = e.clientY - rect.top
+    setDragStart({ x: lx, y: ly })
+    lastMoves.current = [{ x: lx, y: ly, t: performance.now() }]
   }
 
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!isDragging) return
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const rect = canvas.getBoundingClientRect()
+    const now = performance.now()
+    // local coords
+    const lx = e.clientX - rect.left
+    const ly = e.clientY - rect.top
+    // add to recent moves (keep last 8 samples)
+    lastMoves.current.push({ x: lx, y: ly, t: now })
+    if (lastMoves.current.length > 8) lastMoves.current.shift()
 
-    const dx = e.clientX - dragStart.x
-    const dy = e.clientY - dragStart.y
+    // RAF-throttled panning (similar to previous)
+  dragLastRef.current = { x: lx, y: ly }
+    if (rafPanRef.current != null) return
 
-    const scale = 256 * Math.pow(2, mapState.zoom)
-    const dlng = (dx / scale) * 360
-    const dlat = (dy / scale) * 360
+    const panStep = () => {
+      rafPanRef.current = null
+      if (!isDragging || !dragLastRef.current) return
+  const last = dragLastRef.current
+  const dx = last.x - dragStart.x
+  const dy = last.y - dragStart.y
+  const scale = 256 * Math.pow(2, mapStateRef.current.zoom)
+      const dlng = (dx / scale) * 360
+      const dlat = (dy / scale) * 360
+      setMapState((prev) => {
+        const next = {
+          ...prev,
+          centerLng: prev.centerLng - dlng,
+          centerLat: prev.centerLat + dlat,
+        }
+        mapStateRef.current = next
+        return next
+      })
+  setDragStart({ x: last.x, y: last.y })
+      dragLastRef.current = null
+    }
 
-    setMapState((prev) => ({
-      ...prev,
-      centerLng: prev.centerLng - dlng,
-      centerLat: prev.centerLat + dlat,
-    }))
-
-    setDragStart({ x: e.clientX, y: e.clientY })
+    rafPanRef.current = requestAnimationFrame(panStep)
   }
 
-  const handleMouseUp = () => {
+  const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    // release pointer capture
+    try {
+      ;(e.target as Element).releasePointerCapture(e.pointerId)
+    } catch {}
     setIsDragging(false)
+    if (rafPanRef.current) {
+      cancelAnimationFrame(rafPanRef.current)
+      rafPanRef.current = null
+    }
+
+    // compute velocity from lastMoves and start inertia if fast enough
+    const moves = lastMoves.current
+    if (moves.length >= 2) {
+      const last = moves[moves.length - 1]
+      // find an earlier sample ~50-150ms ago
+      let i = moves.length - 2
+      while (i > 0 && last.t - moves[i].t < 40) i--
+      const first = moves[i]
+      const dt = Math.max(1, last.t - first.t)
+      const vx = (last.x - first.x) / dt // px per ms
+      const vy = (last.y - first.y) / dt
+      const speed = Math.hypot(vx, vy)
+      if (speed > 0.05) {
+        // start inertia animation
+        let vX = vx * 16.67 // approximate per-frame pixels (60fps)
+        let vY = vy * 16.67
+        const friction = 0.92
+        const inertiaStep = () => {
+          // convert pixel delta to lat/lng delta
+          const scale = 256 * Math.pow(2, mapStateRef.current.zoom)
+          const dlng = (vX / scale) * 360
+          const dlat = (vY / scale) * 360
+          setMapState((prev) => {
+            const next = {
+              ...prev,
+              centerLng: prev.centerLng - dlng,
+              centerLat: prev.centerLat + dlat,
+            }
+            mapStateRef.current = next
+            return next
+          })
+          vX *= friction
+          vY *= friction
+          if (Math.hypot(vX, vY) > 0.5) {
+            requestAnimationFrame(inertiaStep)
+          }
+        }
+        requestAnimationFrame(inertiaStep)
+      }
+    }
+    lastMoves.current = []
   }
 
   // Handle zoom
@@ -254,8 +572,15 @@ export function MapView() {
     const resizeCanvas = () => {
       const container = canvas.parentElement
       if (container) {
-        canvas.width = container.clientWidth
-        canvas.height = container.clientHeight
+        const dpr = window.devicePixelRatio || 1
+        const cssWidth = container.clientWidth
+        const cssHeight = container.clientHeight
+        canvas.width = Math.max(1, Math.floor(cssWidth * dpr))
+        canvas.height = Math.max(1, Math.floor(cssHeight * dpr))
+        const ctx = canvas.getContext("2d")
+        if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+        // trigger redraw
+        setSizeTick((s) => s + 1)
       }
     }
 
@@ -269,11 +594,13 @@ export function MapView() {
       <canvas
         ref={canvasRef}
         className="absolute inset-0 rounded-xl overflow-hidden shadow-lg z-0 cursor-move"
+        style={{ touchAction: "none" }}
         onClick={handleCanvasClick}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        onPointerLeave={handlePointerUp}
         onWheel={handleWheel}
       />
 
@@ -284,6 +611,28 @@ export function MapView() {
       >
         {isSidebarOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
       </Button>
+
+      {/* Center & Follow controls */}
+      <div className="absolute top-4 left-4 md:left-auto md:right-16 z-20 flex items-center gap-2">
+        <Button onClick={resetToInitial} size="sm" className="shadow-lg" aria-label="Volver al inicio">
+          <span className="hidden md:inline">Inicio</span>
+          <span className="md:hidden">🏠</span>
+        </Button>
+
+        <Button onClick={() => centerOnUser()} className="shadow-lg" size="icon" aria-label="Centrar en mi ubicación">
+          <MapPin className="w-5 h-5" />
+        </Button>
+
+        <Button
+          onClick={() => setIsFollowing((s) => !s)}
+          className={`shadow-lg ${isFollowing ? "bg-primary text-white" : ""}`}
+          size="icon"
+          aria-pressed={isFollowing}
+          aria-label={isFollowing ? "Dejar de seguir" : "Seguir ubicación"}
+        >
+          {isFollowing ? <X className="w-5 h-5" /> : <MapPin className="w-5 h-5" />}
+        </Button>
+      </div>
 
       <Button
         onClick={() => setIsSidebarOpen(!isSidebarOpen)}
@@ -325,11 +674,7 @@ export function MapView() {
                   }`}
                   onClick={() => {
                     setSelectedShelter(shelter)
-                    setMapState({
-                      centerLat: shelter.lat,
-                      centerLng: shelter.lng,
-                      zoom: Math.max(mapState.zoom, 15),
-                    })
+                    animateTo({ centerLat: shelter.lat, centerLng: shelter.lng, zoom: Math.max(mapState.zoom, 15) }, 600)
                     if (window.innerWidth < 768) {
                       setIsSidebarOpen(false)
                     }
