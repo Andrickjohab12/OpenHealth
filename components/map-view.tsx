@@ -91,9 +91,16 @@ export function MapView() {
     const width = canvas.width
     const height = canvas.height
 
-    // Clear canvas
-    ctx.fillStyle = "#e0f2fe"
-    ctx.fillRect(0, 0, width, height)
+    // Create an offscreen canvas for double buffering
+    const offscreenCanvas = document.createElement("canvas")
+    offscreenCanvas.width = width
+    offscreenCanvas.height = height
+    const offscreenCtx = offscreenCanvas.getContext("2d")
+    if (!offscreenCtx) return
+
+    // Clear offscreen canvas
+    offscreenCtx.fillStyle = "#e0f2fe"
+    offscreenCtx.fillRect(0, 0, width, height)
 
     const { centerLat, centerLng, zoom } = mapState
     const centerTile = latLngToTile(centerLat, centerLng, zoom)
@@ -127,7 +134,7 @@ export function MapView() {
             const x = width / 2 + (tileWorldX - centerWorldX)
             const y = height / 2 + (tileWorldY - centerWorldY)
 
-            ctx.drawImage(img, x, y, 256, 256)
+            offscreenCtx.drawImage(img, x, y, 256, 256)
           })
           .catch(() => {
             // Silently fail for missing tiles
@@ -143,39 +150,43 @@ export function MapView() {
         const pos = latLngToPixel(shelter.lat, shelter.lng, zoom, centerLat, centerLng, width, height)
 
         // Draw marker shadow
-        ctx.fillStyle = "rgba(0, 0, 0, 0.2)"
-        ctx.beginPath()
-        ctx.ellipse(pos.x, pos.y + 2, 12, 6, 0, 0, Math.PI * 2)
-        ctx.fill()
+        offscreenCtx.fillStyle = "rgba(0, 0, 0, 0.2)"
+        offscreenCtx.beginPath()
+        offscreenCtx.ellipse(pos.x, pos.y + 2, 12, 6, 0, 0, Math.PI * 2)
+        offscreenCtx.fill()
 
         // Draw marker pin
-        ctx.fillStyle = "#2563eb"
-        ctx.strokeStyle = "white"
-        ctx.lineWidth = 3
-        ctx.beginPath()
-        ctx.arc(pos.x, pos.y - 20, 15, 0, Math.PI * 2)
-        ctx.fill()
-        ctx.stroke()
+        offscreenCtx.fillStyle = "#2563eb"
+        offscreenCtx.strokeStyle = "white"
+        offscreenCtx.lineWidth = 3
+        offscreenCtx.beginPath()
+        offscreenCtx.arc(pos.x, pos.y - 20, 15, 0, Math.PI * 2)
+        offscreenCtx.fill()
+        offscreenCtx.stroke()
 
         // Draw availability indicator
         const color = shelter.availableBeds > 10 ? "#22c55e" : shelter.availableBeds > 0 ? "#eab308" : "#ef4444"
-        ctx.fillStyle = color
-        ctx.strokeStyle = "white"
-        ctx.lineWidth = 2
-        ctx.beginPath()
-        ctx.arc(pos.x + 10, pos.y - 30, 6, 0, Math.PI * 2)
-        ctx.fill()
-        ctx.stroke()
+        offscreenCtx.fillStyle = color
+        offscreenCtx.strokeStyle = "white"
+        offscreenCtx.lineWidth = 2
+        offscreenCtx.beginPath()
+        offscreenCtx.arc(pos.x + 10, pos.y - 30, 6, 0, Math.PI * 2)
+        offscreenCtx.fill()
+        offscreenCtx.stroke()
 
         // Draw pin point
-        ctx.fillStyle = "#2563eb"
-        ctx.beginPath()
-        ctx.moveTo(pos.x, pos.y)
-        ctx.lineTo(pos.x - 6, pos.y - 15)
-        ctx.lineTo(pos.x + 6, pos.y - 15)
-        ctx.closePath()
-        ctx.fill()
+        offscreenCtx.fillStyle = "#2563eb"
+        offscreenCtx.beginPath()
+        offscreenCtx.moveTo(pos.x, pos.y)
+        offscreenCtx.lineTo(pos.x - 6, pos.y - 15)
+        offscreenCtx.lineTo(pos.x + 6, pos.y - 15)
+        offscreenCtx.closePath()
+        offscreenCtx.fill()
       })
+
+      // Clear the main canvas and draw the fully rendered offscreen canvas
+      ctx.clearRect(0, 0, width, height)
+      ctx.drawImage(offscreenCanvas, 0, 0)
     })
   }, [mapState])
 
@@ -256,6 +267,8 @@ export function MapView() {
       if (container) {
         canvas.width = container.clientWidth
         canvas.height = container.clientHeight
+        // Trigger a re-render to draw the map on the resized canvas
+        setMapState((prev) => ({ ...prev }))
       }
     }
 
