@@ -20,7 +20,7 @@ export function MapView() {
     zoom: 13,
   })
   const [isDragging, setIsDragging] = useState(false)
-  const [dragStart, setDragStart] = useState({ x: 0, y: 0 })
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0, lat: 0, lng: 0 })
   const tilesCache = useRef<Map<string, HTMLImageElement>>(new Map())
 
   // Convert lat/lng to tile coordinates
@@ -58,6 +58,32 @@ export function MapView() {
       x: width / 2 + (worldX - centerWorldX),
       y: height / 2 + (worldY - centerWorldY),
     }
+  }
+
+  const pixelToLatLng = (
+    px: number,
+    py: number,
+    zoom: number,
+    centerLat: number,
+    centerLng: number,
+    width: number,
+    height: number,
+  ) => {
+    const scale = 256 * Math.pow(2, zoom)
+    const centerWorldX = ((centerLng + 180) / 360) * scale
+    const centerWorldY =
+      ((1 - Math.log(Math.tan((centerLat * Math.PI) / 180) + 1 / Math.cos((centerLat * Math.PI) / 180)) / Math.PI) /
+        2) *
+      scale
+
+    const worldX = centerWorldX + (px - width / 2)
+    const worldY = centerWorldY + (py - height / 2)
+
+    const lng = (worldX / scale) * 360 - 180
+    const n = Math.PI - (2 * Math.PI * worldY) / scale
+    const lat = (180 / Math.PI) * Math.atan(Math.sinh(n))
+
+    return { lat, lng }
   }
 
   // Load and cache tile images
@@ -221,26 +247,25 @@ export function MapView() {
   // Handle mouse drag
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     setIsDragging(true)
-    setDragStart({ x: e.clientX, y: e.clientY })
+    setDragStart({ x: e.clientX, y: e.clientY, lat: mapState.centerLat, lng: mapState.centerLng })
   }
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!isDragging) return
+    if (!isDragging || !canvasRef.current) return
 
     const dx = e.clientX - dragStart.x
     const dy = e.clientY - dragStart.y
 
-    const scale = 256 * Math.pow(2, mapState.zoom)
-    const dlng = (dx / scale) * 360
-    const dlat = (dy / scale) * 360
+    const { width, height } = canvasRef.current
+    const { zoom } = mapState
+
+    const newCenter = pixelToLatLng(width / 2 - dx, height / 2 - dy, zoom, dragStart.lat, dragStart.lng, width, height)
 
     setMapState((prev) => ({
       ...prev,
-      centerLng: prev.centerLng - dlng,
-      centerLat: prev.centerLat + dlat,
+      centerLat: newCenter.lat,
+      centerLng: newCenter.lng,
     }))
-
-    setDragStart({ x: e.clientX, y: e.clientY })
   }
 
   const handleMouseUp = () => {
@@ -250,7 +275,7 @@ export function MapView() {
   // Handle zoom
   const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
     e.preventDefault()
-    const delta = e.deltaY > 0 ? -.8 : .8
+    const delta = e.deltaY > 0 ? -0.2 : 0.2
     setMapState((prev) => ({
       ...prev,
       zoom: Math.max(10, Math.min(18, prev.zoom + delta)),
